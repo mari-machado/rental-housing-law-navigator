@@ -1,0 +1,21 @@
+[project]
+name = "rental-housing-law-navigator"
+version = "0.1.0"
+description = "Backend and processing pipeline for the Rental Housing Law Navigator hackathon project"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.6",
+  "pandas>=2.2.0",
+  "pydantic>=2.9.0",
+  "python-dotenv>=1.0.0",
+  "requests>=2.32.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["backend", "backend.app", "backend.core", "backend.services", "src"]
