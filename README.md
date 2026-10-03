@@ -161,7 +161,7 @@ Este projeto continua sendo um protótipo para hackathon. Ele não substitui int
 
 - refinamento do corpus e do matching de jurisdição
 - cobertura de condições como ano de construção, número de unidades, exceções e regras locais
-- validação completa com o `score.py` do desafio e execução com a dev key
+- validação local com o `score.py` do repositório; a pontuação oficial do desafio exige a dev key fornecida pelos organizadores
 - testes de casos T6 e cenários de mudança de data
 
 ## Licença

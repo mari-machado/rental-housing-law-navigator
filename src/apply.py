@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -39,67 +40,139 @@ def _matches_city_or_state(rule_jurisdiction: str, city: str, state: str) -> boo
         return True
     if rule_norm == state_norm:
         return True
-    if rule_norm.endswith(f", {state_norm}"):
-        city_part = rule_norm.rsplit(",", 1)[0].strip()
-        return city_part == city_norm
-    if rule_norm.endswith(f", {city_norm}, {state_norm}"):
-        return True
+    if "," in rule_norm:
+        city_part, state_part = [part.strip() for part in rule_norm.rsplit(",", 1)]
+        if city_part == city_norm and state_part == state_norm:
+            return True
+        if state_part == state_norm and city_part == city_norm:
+            return True
     return False
 
 
-def _missing_coverage_fact(rule: dict, address: dict | None) -> bool:
+def _extract_numeric_threshold(text: str, *, field: str) -> int | None:
+    patterns = [
+        rf"(?:before|on or before|prior to|not later than)\s*(\d{{4}})",
+        rf"(?:after|on or after|later than)\s*(\d{{4}})",
+        rf"(\d{{4}})\s*(?:cutoff|threshold|year)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                continue
+    if field == "units":
+        for match in re.finditer(r"(\d+)\s*(?:\+|or more|or fewer|units?|dwelling units?)", text, flags=re.IGNORECASE):
+            try:
+                return int(match.group(1))
+            except ValueError:
+                continue
+    return None
+
+
+def _rule_requires_fact(rule: dict, fact_name: str) -> bool:
+    text = " ".join([
+        str(rule.get("coverage_conditions") or ""),
+        str(rule.get("requirement") or ""),
+        str(rule.get("exemptions") or ""),
+        str(rule.get("interaction") or ""),
+    ]).lower()
+    return fact_name in text or fact_name.replace("_", " ") in text
+
+
+def _coverage_status(rule: dict, address: dict | None) -> str | None:
     if not isinstance(address, dict):
-        return False
-    conditions_text = " ".join(
-        [
-            str(rule.get("coverage_conditions") or ""),
-            str(rule.get("requirement") or ""),
-            str(rule.get("interaction") or ""),
-            str(rule.get("exemptions") or ""),
-        ]
-    ).lower()
-    if "year_built" in conditions_text or "year built" in conditions_text or "building age" in conditions_text:
-        if not str(address.get("year_built") or "").strip():
-            return True
-    if "units" in conditions_text or "unit count" in conditions_text or "unit" in conditions_text:
-        if not str(address.get("units") or "").strip():
-            return True
-    if "owner" in conditions_text and "owner-occupied" in conditions_text:
-        if not str(address.get("use_code") or "").strip():
-            return True
-    return False
+        return None
+
+    text = " ".join([
+        str(rule.get("coverage_conditions") or ""),
+        str(rule.get("requirement") or ""),
+        str(rule.get("exemptions") or ""),
+        str(rule.get("interaction") or ""),
+    ])
+    text_lower = text.lower()
+
+    if "year built" in text_lower or "certificate" in text_lower or "built before" in text_lower or "before" in text_lower and "year" in text_lower:
+        year_built = address.get("year_built")
+        if not year_built:
+            return "unknown"
+        threshold = _extract_numeric_threshold(text, field="year")
+        if threshold is not None:
+            try:
+                year_int = int(str(year_built).strip())
+                if "before" in text_lower or "on or before" in text_lower or "prior to" in text_lower:
+                    return "applies" if year_int <= threshold else None
+                if "after" in text_lower or "later than" in text_lower:
+                    return "applies" if year_int > threshold else None
+            except ValueError:
+                pass
+
+    if "unit" in text_lower and "unit count" in text_lower or "units" in text_lower or "dwelling" in text_lower:
+        units = address.get("units")
+        if units in (None, "", "unknown"):
+            return "unknown"
+        try:
+            units_int = int(str(units).strip())
+        except ValueError:
+            return "unknown"
+        threshold = _extract_numeric_threshold(text, field="units")
+        if threshold is not None:
+            if "5 or more" in text_lower or "5+" in text_lower or "five or more" in text_lower:
+                return "applies" if units_int >= threshold else None
+            if "2 or fewer" in text_lower or "two or fewer" in text_lower:
+                return "applies" if units_int <= threshold else None
+            if "under" in text_lower and "units" in text_lower:
+                return "applies" if units_int < threshold else None
+
+    if "owner-occupied" in text_lower or "owner occupied" in text_lower or "small-landlord" in text_lower:
+        if not address.get("use_code"):
+            return "unknown"
+
+    return "applies"
 
 
-def _evaluate_rule(rule: dict, city: str, state: str, as_of: str, address: dict | None = None) -> str:
-    status = str(rule.get("status") or "in_force")
+def evaluate_rule(rule: dict, city: str, state: str, as_of: str, address: dict | None = None) -> str | None:
+    rule_jurisdiction = str(rule.get("jurisdiction") or "").strip()
+    if not rule_jurisdiction:
+        return None
+
+    if not _matches_city_or_state(rule_jurisdiction, city, state):
+        return "unknown"
+
+    status = str(rule.get("status") or "in_force").strip().lower()
     if status == "pending":
         return "pending"
     if status == "superseded":
         return "superseded"
-    if status == "not_yet_effective":
-        effective = _parse_date(rule.get("effective_date"))
-        as_of_date = _parse_date(as_of)
-        if as_of_date and effective and as_of_date < effective:
-            return "not_yet_effective"
+    if status == "failed":
+        return None
 
-    if _missing_coverage_fact(rule, address):
+    effective_date = _parse_date(rule.get("effective_date"))
+    as_of_date = _parse_date(as_of)
+    if effective_date and as_of_date and effective_date > as_of_date:
+        return "not_yet_effective"
+
+    coverage_result = _coverage_status(rule, address)
+    if coverage_result == "unknown":
+        return "unknown"
+    if coverage_result is None:
+        if not any(str(rule.get(field) or "").strip() for field in ("coverage_conditions", "requirement", "exemptions", "interaction", "key_value")):
+            return "applies"
         return "unknown"
 
-    rule_jurisdiction = str(rule.get("jurisdiction") or "").strip()
-    if not rule_jurisdiction:
-        return "unknown"
+    return "applies"
 
-    if "," in rule_jurisdiction:
-        return "applies" if _matches_city_or_state(rule_jurisdiction, city, state) else "unknown"
 
-    if rule_jurisdiction.upper() == state.upper():
-        return "applies"
-    return "unknown"
+# Backward-compatible alias used by the challenge tests and older code paths.
+_evaluate_rule = evaluate_rule
 
 
 def apply_rules(rules_path: Path, jurisdictions_path: Path, as_of: str = DEFAULT_AS_OF) -> dict:
     rules = json.loads(rules_path.read_text(encoding="utf-8")) if rules_path.exists() else []
     jurisdictions = json.loads(jurisdictions_path.read_text(encoding="utf-8")) if jurisdictions_path.exists() else []
+    if isinstance(rules, dict):
+        rules = rules.get("rules", [])
 
     lookups: dict[str, list[dict]] = {}
     for address in jurisdictions:
@@ -108,7 +181,9 @@ def apply_rules(rules_path: Path, jurisdictions_path: Path, as_of: str = DEFAULT
         state = str(address.get("state") or "").strip().upper()
         results: list[dict] = []
         for rule in rules:
-            result = _evaluate_rule(rule, city, state, as_of, address)
+            result = evaluate_rule(rule, city, state, as_of, address)
+            if result is None:
+                continue
             results.append(
                 {
                     "team_rule_id": rule.get("team_rule_id"),

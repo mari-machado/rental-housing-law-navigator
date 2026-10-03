@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import csv
 import re
-from datetime import date
 
 from backend.core.config import settings
 from backend.services.rule_service import load_rules
+from src.apply import evaluate_rule
 
 
 def normalize_text(value: str | None) -> str:
@@ -36,64 +36,6 @@ def find_address_match(address: str) -> dict | None:
     return None
 
 
-def _parse_date(value: str | None) -> date | None:
-    if not value:
-        return None
-    try:
-        return date.fromisoformat(value[:10])
-    except ValueError:
-        return None
-
-
-def _normalize_jurisdiction(value: str) -> str:
-    return " ".join((value or "").strip().split()).lower()
-
-
-def _matches_city_or_state(rule_jurisdiction: str, city: str, state: str) -> bool:
-    if not rule_jurisdiction:
-        return False
-
-    city_norm = (city or "").strip().lower()
-    state_norm = (state or "").strip().lower()
-    rule_norm = _normalize_jurisdiction(rule_jurisdiction)
-
-    if not city_norm:
-        return False
-
-    if rule_norm == city_norm:
-        return True
-    if rule_norm == state_norm:
-        return True
-    if rule_norm.endswith(f", {state_norm}"):
-        city_part = rule_norm.rsplit(",", 1)[0].strip()
-        return city_part == city_norm
-    return False
-
-
-def _evaluate_rule(rule: dict, city: str, state: str, as_of: str) -> str:
-    raw_status = str(rule.get("status") or "in_force")
-    as_of_date = _parse_date(as_of)
-    effective_date = _parse_date(rule.get("effective_date"))
-
-    if raw_status == "pending":
-        return "pending"
-    if raw_status == "superseded":
-        return "superseded"
-    if raw_status == "not_yet_effective" and as_of_date and effective_date and as_of_date < effective_date:
-        return "not_yet_effective"
-
-    jur = str(rule.get("jurisdiction") or "").strip()
-    if not jur:
-        return "unknown"
-
-    if "," in jur:
-        return "applies" if _matches_city_or_state(jur, city, state) else "unknown"
-
-    if jur.upper() == state.upper():
-        return "applies"
-    return "unknown"
-
-
 def get_address_coverage(address: str, as_of: str = settings.as_of_date) -> dict:
     normalized = address.strip()
     if not normalized:
@@ -117,7 +59,9 @@ def get_address_coverage(address: str, as_of: str = settings.as_of_date) -> dict
 
     results = []
     for rule in rules:
-        result = _evaluate_rule(rule, city, state, as_of)
+        result = evaluate_rule(rule, city, state, as_of, row)
+        if result is None:
+            continue
         results.append(
             {
                 "team_rule_id": rule.get("team_rule_id"),

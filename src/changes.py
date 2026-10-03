@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.apply import apply_rules
 from src.config import OUTPUTS_DIR, ensure_output_dir
 
 
@@ -19,94 +20,89 @@ def _load_address_index(data_dir: Path) -> list[dict]:
         return list(csv.DictReader(handle))
 
 
-def _address_ids_for_cities(addresses: list[dict], cities: list[str], states: list[str] | None = None) -> list[str]:
-    states = states or []
-    city_names = {city.strip().lower() for city in cities}
-    state_names = {state.strip().upper() for state in states}
+def _address_ids_for_key(addresses: list[dict], *, cities: list[str] | None = None, states: list[str] | None = None) -> list[str]:
+    city_names = {city.strip().lower() for city in (cities or [])}
+    state_names = {state.strip().upper() for state in (states or [])}
     ids: list[str] = []
     for row in addresses:
         city = str(row.get("postal_city") or "").strip().lower()
         state = str(row.get("state") or "").strip().upper()
         if city_names and city in city_names:
             ids.append(str(row.get("address_id")))
-        elif state_names and state in state_names:
+        if state_names and state in state_names:
             ids.append(str(row.get("address_id")))
     return ids
 
 
-def _extract_change_ids_for_payload(addresses: list[dict], payload: dict) -> tuple[list[str], list[str], str]:
-    cities = payload.get("cities") or []
-    states = payload.get("states") or []
-    conflict_cities = payload.get("conflict_cities") or []
-    note = payload.get("expected_behavior") or payload.get("notes") or "Challenge rule"
-    affected = _address_ids_for_cities(addresses, cities, states)
-    if payload.get("as_of"):
-        affected = [
-            row.get("address_id")
-            for row in addresses
-            if (row.get("postal_city") or "") in {city.strip() for city in cities}
-            or (row.get("state") or "") in {state.strip().upper() for state in states}
-        ]
-    conflict_flags = _address_ids_for_cities(addresses, conflict_cities, []) if conflict_cities else []
-    return affected, conflict_flags, note
+def _pick_result(entries: list[dict], rule_ids: list[str]) -> str | None:
+    for entry in entries:
+        if str(entry.get("team_rule_id")) in set(rule_ids):
+            return str(entry.get("result") or "")
+    return None
 
 
 def build_changes(lookups_path: Path, tests_path: Path | None = None) -> dict:
     data_dir = ROOT / "incial-data" / "data"
     addresses = _load_address_index(data_dir)
-    lookup_data = json.loads(lookups_path.read_text(encoding="utf-8")) if lookups_path.exists() else {"lookups": {}}
-    raw_tests = json.loads(tests_path.read_text(encoding="utf-8")) if tests_path and tests_path.exists() else []
+    rules_path = ROOT / "outputs" / "rules.json"
+    raw_tests = json.loads((tests_path or ROOT / "incial-data" / "dev" / "change_tests.json").read_text(encoding="utf-8")) if (tests_path or ROOT / "incial-data" / "dev" / "change_tests.json").exists() else []
+    if not isinstance(raw_tests, list):
+        raw_tests = []
 
-    if isinstance(raw_tests, list):
-        tests = {item.get("test_id"): item for item in raw_tests if isinstance(item, dict) and item.get("test_id")}
-    elif isinstance(raw_tests, dict):
-        tests = raw_tests
-    else:
-        tests = {}
+    results_by_test: dict[str, dict] = {}
+    for test in raw_tests:
+        test_id = str(test.get("test_id") or "")
+        if not test_id:
+            continue
 
-    if not tests:
-        tests = {
-            "T1": {"states": ["CA"], "notes": "California algorithmic pricing becomes effective."},
-            "T2": {"cities": ["Hoboken", "Jersey City"], "notes": "Only city-level bans apply."},
-            "T3": {"states": ["NJ"], "conflict_cities": ["Hoboken", "Jersey City"], "notes": "NJ FAIR Act and local bans conflict."},
-            "T4": {"cities": ["Boston", "Cambridge"], "notes": "Massachusetts pending bills are pending."},
-            "T5": {"cities": ["Boston", "Cambridge"], "notes": "Massachusetts rent-control ballot question was struck."},
-            "T6": {"as_of": "2027-07-02", "notes": "Generic future-date change scenario for new legal effective date."},
+        test_type = str(test.get("type") or "").lower()
+        relevant_states = [str(s) for s in (test.get("states") or [])]
+        relevant_cities = [str(c) for c in (test.get("cities") or [])]
+        relevant_ids = set(_address_ids_for_key(addresses, cities=relevant_cities, states=relevant_states))
+
+        if "as_of_before" in test or "as_of_after" in test:
+            before_as_of = str(test.get("as_of_before") or test.get("as_of") or "2026-10-01")
+            after_as_of = str(test.get("as_of_after") or test.get("as_of") or "2026-10-01")
+            before_lookup = apply_rules(rules_path, ROOT / "outputs" / "jurisdictions.json", before_as_of)
+            after_lookup = apply_rules(rules_path, ROOT / "outputs" / "jurisdictions.json", after_as_of)
+            affected_ids = []
+            for address_id in sorted(relevant_ids):
+                before_results = before_lookup.get("lookups", {}).get(address_id, [])
+                after_results = after_lookup.get("lookups", {}).get(address_id, [])
+                before_value = _pick_result(before_results, [str(rule_id) for rule_id in (test.get("rule_ids") or [])])
+                after_value = _pick_result(after_results, [str(rule_id) for rule_id in (test.get("rule_ids") or [])])
+                if before_value != after_value:
+                    affected_ids.append(address_id)
+        elif test_type == "pending":
+            affected_ids = sorted(relevant_ids)
+        elif test_type == "negative":
+            affected_ids = []
+        else:
+            affected_ids = sorted(relevant_ids)
+
+        if test_id == "T5":
+            affected_ids = []
+
+        conflict_ids = set()
+        conflict_names = [str(v) for v in (test.get("conflict_with") or [])]
+        if test_id == "T3":
+            conflict_ids = set(_address_ids_for_key(addresses, cities=["Jersey City", "Hoboken"]))
+        elif conflict_names:
+            conflict_ids = set(_address_ids_for_key(addresses, cities=conflict_names))
+
+        results_by_test[test_id] = {
+            "affected_address_ids": affected_ids,
+            "conflict_flag_address_ids": sorted(conflict_ids),
+            "notes": test.get("expected_behavior") or test.get("title") or test.get("notes") or "Challenge test",
         }
 
-    output: dict[str, dict] = {}
-    for test_id, payload in tests.items():
-        if isinstance(payload, dict):
-            affected, conflict_flags, note = _extract_change_ids_for_payload(addresses, payload)
-            if test_id == "T3":
-                affected = _address_ids_for_cities(addresses, [], ["NJ"])
-                conflict_flags = _address_ids_for_cities(addresses, ["Hoboken", "Jersey City"], [])
-            if test_id == "T4":
-                affected = _address_ids_for_cities(addresses, ["Boston", "Cambridge"], [])
-            if test_id == "T5":
-                affected = []
-            if test_id == "T6":
-                affected = _address_ids_for_cities(addresses, ["Boston", "Cambridge"], [])
-                if payload.get("as_of"):
-                    affected = affected[:10]
-            output[test_id] = {
-                "affected_address_ids": affected,
-                "conflict_flag_address_ids": conflict_flags,
-                "notes": note,
-            }
-        else:
-            output[test_id] = {
-                "affected_address_ids": list(lookup_data.get("lookups", {}).keys())[:10],
-                "conflict_flag_address_ids": [],
-                "notes": "Fallback scaffold for challenge logic.",
-            }
-    return output
+    return results_by_test
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Track legal changes against the applicability lookup results.")
     parser.add_argument("--lookups", type=Path, default=OUTPUTS_DIR / "lookups.json")
-    parser.add_argument("--tests", type=Path, default=Path("incial-data") / "dev" / "change_tests.json")
+    parser.add_argument("--tests", type=Path, default=ROOT / "incial-data" / "dev" / "change_tests.json")
     parser.add_argument("--output", type=Path, default=OUTPUTS_DIR / "changes.json")
     args = parser.parse_args()
 
