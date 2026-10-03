@@ -10,6 +10,18 @@ if str(ROOT) not in sys.path:
 
 from src.config import DATA_DIR, OUTPUTS_DIR, ensure_output_dir
 
+CITY_ALIASES = {
+    "Van Nuys": "Los Angeles",
+    "Dorchester": "Boston",
+    "South Boston": "Boston",
+    "East Boston": "Boston",
+    "Jersey city": "Jersey City",
+    "Hoboken": "Hoboken",
+    "Berkeley": "Berkeley",
+    "Cambridge": "Cambridge",
+    "Los Angeles": "Los Angeles",
+}
+
 COUNTY_BY_CITY_STATE = {
     ("Los Angeles", "CA"): "Los Angeles",
     ("Berkeley", "CA"): "Alameda",
@@ -18,7 +30,16 @@ COUNTY_BY_CITY_STATE = {
     ("Hoboken", "NJ"): "Hudson",
     ("Jersey City", "NJ"): "Hudson",
     ("Newark", "NJ"): "Essex",
+    ("Van Nuys", "CA"): "Los Angeles",
+    ("Dorchester", "MA"): "Suffolk",
 }
+
+
+def _derive_legal_city(city: str) -> str:
+    city_norm = (city or "").strip()
+    if not city_norm:
+        return city_norm
+    return CITY_ALIASES.get(city_norm, city_norm)
 
 
 def _derive_county(city: str, state: str) -> str | None:
@@ -38,20 +59,23 @@ def geocode_addresses(data_dir: Path = DATA_DIR) -> list[dict]:
         for row in reader:
             city = (row.get("postal_city") or "").strip()
             state = (row.get("state") or "").strip()
-            county = _derive_county(city, state)
-            jurisdiction = f"{city}, {state}" if city and state else state or "unknown"
-            legal_jurisdiction = f"{city}, {county}, {state}" if city and county and state else jurisdiction
+            legal_city = _derive_legal_city(city)
+            county = _derive_county(legal_city, state)
+            jurisdiction = f"{legal_city}, {state}" if legal_city and state else state or "unknown"
+            legal_jurisdiction = f"{legal_city}, {county}, {state}" if legal_city and county and state else jurisdiction
             jurisdictions.append(
                 {
                     "address_id": row.get("address_id"),
                     "street_address": row.get("street_address"),
                     "postal_city": city,
+                    "legal_city": legal_city,
                     "state": state,
                     "county": county,
                     "jurisdiction": jurisdiction,
                     "legal_jurisdiction": legal_jurisdiction,
                     "year_built": row.get("year_built"),
                     "units": row.get("units"),
+                    "use_code": row.get("use_code"),
                 }
             )
     return jurisdictions

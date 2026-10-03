@@ -15,10 +15,14 @@ from src.config import DEFAULT_AS_OF, OUTPUTS_DIR, ensure_output_dir
 def _parse_date(value: str | None) -> date | None:
     if not value:
         return None
+    text = str(value).strip()
     try:
-        return date.fromisoformat(value[:10])
+        return date.fromisoformat(text[:10])
     except ValueError:
-        return None
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            return None
 
 
 def _normalize_jurisdiction(value: str) -> str:
@@ -33,19 +37,20 @@ def _matches_city_or_state(rule_jurisdiction: str, city: str, state: str) -> boo
     state_norm = (state or "").strip().lower()
     rule_norm = _normalize_jurisdiction(rule_jurisdiction)
 
-    if not city_norm:
+    if not city_norm or not state_norm:
         return False
 
-    if rule_norm == city_norm:
+    if rule_norm == city_norm or rule_norm == state_norm:
         return True
-    if rule_norm == state_norm:
-        return True
-    if "," in rule_norm:
-        city_part, state_part = [part.strip() for part in rule_norm.rsplit(",", 1)]
-        if city_part == city_norm and state_part == state_norm:
+
+    for candidate in [f"{city_norm}, {state_norm}", f"{city_norm},{state_norm}"]:
+        if rule_norm == candidate:
             return True
-        if state_part == state_norm and city_part == city_norm:
-            return True
+
+    if rule_norm.endswith(f", {state_norm}"):
+        city_part = rule_norm.rsplit(",", 1)[0].strip()
+        return city_part == city_norm
+
     return False
 
 
@@ -93,28 +98,29 @@ def _coverage_status(rule: dict, address: dict | None) -> str | None:
     ])
     text_lower = text.lower()
 
-    if "year built" in text_lower or "certificate" in text_lower or "built before" in text_lower or "before" in text_lower and "year" in text_lower:
+    if any(token in text_lower for token in ["year built", "certificate of occupancy", "built before", "before", "after", "year of construction"]):
         year_built = address.get("year_built")
-        if not year_built:
+        if year_built in (None, "", "unknown"):
+            return "unknown"
+        try:
+            year_int = int(str(year_built).strip())
+        except (TypeError, ValueError):
             return "unknown"
         threshold = _extract_numeric_threshold(text, field="year")
         if threshold is not None:
-            try:
-                year_int = int(str(year_built).strip())
-                if "before" in text_lower or "on or before" in text_lower or "prior to" in text_lower:
-                    return "applies" if year_int <= threshold else None
-                if "after" in text_lower or "later than" in text_lower:
-                    return "applies" if year_int > threshold else None
-            except ValueError:
-                pass
+            if "before" in text_lower or "on or before" in text_lower or "prior to" in text_lower:
+                return "applies" if year_int <= threshold else None
+            if "after" in text_lower or "later than" in text_lower:
+                return "applies" if year_int > threshold else None
+        return "applies"
 
-    if "unit" in text_lower and "unit count" in text_lower or "units" in text_lower or "dwelling" in text_lower:
+    if any(token in text_lower for token in ["unit count", "units", "dwelling units", "number of units"]):
         units = address.get("units")
         if units in (None, "", "unknown"):
             return "unknown"
         try:
             units_int = int(str(units).strip())
-        except ValueError:
+        except (TypeError, ValueError):
             return "unknown"
         threshold = _extract_numeric_threshold(text, field="units")
         if threshold is not None:
@@ -124,6 +130,7 @@ def _coverage_status(rule: dict, address: dict | None) -> str | None:
                 return "applies" if units_int <= threshold else None
             if "under" in text_lower and "units" in text_lower:
                 return "applies" if units_int < threshold else None
+        return "applies"
 
     if "owner-occupied" in text_lower or "owner occupied" in text_lower or "small-landlord" in text_lower:
         if not address.get("use_code"):
@@ -138,7 +145,7 @@ def evaluate_rule(rule: dict, city: str, state: str, as_of: str, address: dict |
         return None
 
     if not _matches_city_or_state(rule_jurisdiction, city, state):
-        return "unknown"
+        return None
 
     status = str(rule.get("status") or "in_force").strip().lower()
     if status == "pending":
@@ -157,9 +164,9 @@ def evaluate_rule(rule: dict, city: str, state: str, as_of: str, address: dict |
     if coverage_result == "unknown":
         return "unknown"
     if coverage_result is None:
-        if not any(str(rule.get(field) or "").strip() for field in ("coverage_conditions", "requirement", "exemptions", "interaction", "key_value")):
-            return "applies"
-        return "unknown"
+        if any(token in str(rule.get("coverage_conditions") or "").lower() for token in ["year built", "unit count", "owner-occupied", "owner occupied", "small-landlord"]):
+            return "unknown"
+        return "applies"
 
     return "applies"
 

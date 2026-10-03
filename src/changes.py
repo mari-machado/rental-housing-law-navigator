@@ -35,17 +35,49 @@ def _address_ids_for_key(addresses: list[dict], *, cities: list[str] | None = No
 
 
 def _pick_result(entries: list[dict], rule_ids: list[str]) -> str | None:
+    rule_set = {str(rule_id) for rule_id in rule_ids}
     for entry in entries:
-        if str(entry.get("team_rule_id")) in set(rule_ids):
+        if str(entry.get("team_rule_id")) in rule_set:
             return str(entry.get("result") or "")
     return None
+
+
+def _test_rule_ids(test: dict, rules: list[dict]) -> list[str]:
+    rule_ids = [str(rule_id) for rule_id in (test.get("rule_ids") or [])]
+    if rule_ids:
+        return rule_ids
+
+    category = str(test.get("category") or "").strip().lower()
+    states = [str(state) for state in (test.get("states") or [])]
+    cities = [str(city) for city in (test.get("cities") or [])]
+
+    if category:
+        return [
+            str(rule.get("team_rule_id"))
+            for rule in rules
+            if str(rule.get("category") or "").lower() == category
+        ]
+
+    matched: list[str] = []
+    for rule in rules:
+        jurisdiction = str(rule.get("jurisdiction") or "").lower()
+        if cities and any(city.lower() in jurisdiction for city in cities):
+            matched.append(str(rule.get("team_rule_id")))
+        elif states and any(state.lower() in jurisdiction for state in states):
+            matched.append(str(rule.get("team_rule_id")))
+    return matched
 
 
 def build_changes(lookups_path: Path, tests_path: Path | None = None) -> dict:
     data_dir = ROOT / "incial-data" / "data"
     addresses = _load_address_index(data_dir)
     rules_path = ROOT / "outputs" / "rules.json"
-    raw_tests = json.loads((tests_path or ROOT / "incial-data" / "dev" / "change_tests.json").read_text(encoding="utf-8")) if (tests_path or ROOT / "incial-data" / "dev" / "change_tests.json").exists() else []
+    rules = json.loads(rules_path.read_text(encoding="utf-8")) if rules_path.exists() else []
+    if isinstance(rules, dict):
+        rules = rules.get("rules", [])
+
+    test_file = tests_path or ROOT / "incial-data" / "dev" / "change_tests.json"
+    raw_tests = json.loads(test_file.read_text(encoding="utf-8")) if test_file.exists() else []
     if not isinstance(raw_tests, list):
         raw_tests = []
 
@@ -59,6 +91,7 @@ def build_changes(lookups_path: Path, tests_path: Path | None = None) -> dict:
         relevant_states = [str(s) for s in (test.get("states") or [])]
         relevant_cities = [str(c) for c in (test.get("cities") or [])]
         relevant_ids = set(_address_ids_for_key(addresses, cities=relevant_cities, states=relevant_states))
+        rule_ids = _test_rule_ids(test, rules)
 
         if "as_of_before" in test or "as_of_after" in test:
             before_as_of = str(test.get("as_of_before") or test.get("as_of") or "2026-10-01")
@@ -69,8 +102,8 @@ def build_changes(lookups_path: Path, tests_path: Path | None = None) -> dict:
             for address_id in sorted(relevant_ids):
                 before_results = before_lookup.get("lookups", {}).get(address_id, [])
                 after_results = after_lookup.get("lookups", {}).get(address_id, [])
-                before_value = _pick_result(before_results, [str(rule_id) for rule_id in (test.get("rule_ids") or [])])
-                after_value = _pick_result(after_results, [str(rule_id) for rule_id in (test.get("rule_ids") or [])])
+                before_value = _pick_result(before_results, rule_ids)
+                after_value = _pick_result(after_results, rule_ids)
                 if before_value != after_value:
                     affected_ids.append(address_id)
         elif test_type == "pending":
